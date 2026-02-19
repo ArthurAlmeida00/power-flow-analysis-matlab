@@ -1,0 +1,261 @@
+function Tl_ArthurAlmeida()
+    clear; clc;
+    Sb = 100; % Base MVA
+    
+    % Dados Linhas: [De Para R(pu) X(pu) B_MVAR(total) Limite(MVA)]
+    lineData = [
+        1 2 0.0040 0.040 12 300;
+        1 4 0.0040 0.040 12 300;
+        2 3 0.0020 0.020  5 300;
+        3 4 0.0070 0.070 20 300
+    ];
+
+    % Dados Barras: [Barra Pg(MW) Qg(MVAR) Pd(MW) Qd(MVAR) Tipo(1=Slack, 2=PQ, 3=PV)]
+    busData = [
+        1   0   0   0   0   1;
+        2   0   0 200 100   2;
+        3 200   0   0   0   3;
+        4   0   0 300 150   2
+    ];
+
+    disp('Escolha do método de resolução:');
+    disp('1. Newton Raphson');
+    disp('2. Desacoplado Rápido');
+    opcao = input('Opção: ');
+
+    % Primeira simulação
+    fprintf('\n================ SIMULAÇÃO INICIAL ================\n');
+    [~, S_lines, overloads] = run_power_flow(opcao, lineData, busData, Sb);
+    
+    % Passo 3: Reforço do sistema se houver sobrecarga
+    if ~isempty(overloads)
+        fprintf('\n================ REFORÇO DE REDE ================\n');
+        fprintf('Aplicando duplicação de circuito nas linhas sobrecarregadas...\n');
+        for i = 1:length(overloads)
+            idx = overloads(i);
+            lineData(idx, 3) = lineData(idx, 3) / 2; % R/2
+            lineData(idx, 4) = lineData(idx, 4) / 2; % X/2
+            lineData(idx, 5) = lineData(idx, 5) * 2; % B_MVAR*2
+            lineData(idx, 6) = lineData(idx, 6) * 2; % Limite térmico*2
+        end
+        % Segunda simulação pós-reforço
+        run_power_flow(opcao, lineData, busData, Sb);
+    end
+end
+
+function [V, S_lines, overloads] = run_power_flow(opcao, lineData, busData, Sb)
+    numBuses = size(busData, 1);
+    Ybus = buildYbus(lineData, numBuses, Sb);
+    
+    if opcao == 1
+        [V, S_lines] = Newton_Raphson(busData, Ybus, Sb, numBuses);
+    elseif opcao == 2
+        [V, S_lines] = Desacoplado_Rapido(busData, Ybus, Sb, numBuses);
+    else
+        error('Opção inválida.');
+    end
+    
+    overloads = checkOverload(S_lines, lineData, Sb);
+end
+
+function Ybus = buildYbus(lineData, numBuses, Sb)
+    Ybus = zeros(numBuses, numBuses);
+    for k = 1:size(lineData, 1)
+        f = lineData(k, 1);
+        t = lineData(k, 2);
+        y_serie = 1 / (lineData(k, 3) + 1j * lineData(k, 4));
+        b_shunt = 1j * (lineData(k, 5) / Sb) / 2; % Metade de susceptância para cada lado
+        
+        Ybus(f, f) = Ybus(f, f) + y_serie + b_shunt;
+        Ybus(t, t) = Ybus(t, t) + y_serie + b_shunt;
+        Ybus(f, t) = Ybus(f, t) - y_serie;
+        Ybus(t, f) = Ybus(t, f) - y_serie;
+    end
+end
+
+function overloads = checkOverload(S_lines, lineData, Sb)
+    overloads = [];
+    fprintf('\n--- Fluxo e Verificação de Sobrecarga ---\n');
+    for k = 1:size(lineData, 1)
+        f = lineData(k, 1);
+        t = lineData(k, 2);
+        limite_pu = lineData(k, 6) / Sb;
+        fluxo_pu = abs(S_lines(f, t));
+        
+        fprintf('Linha %d-%d: S = %.4f pu | Limite = %.2f pu\n', f, t, fluxo_pu, limite_pu);
+        if fluxo_pu > limite_pu
+            overloads = [overloads; k];
+        end
+    end
+end
+
+function [V, S] = Newton_Raphson(busData, Ybus, Sb, numBuses)
+    G = real(Ybus);
+    B = imag(Ybus);
+    
+    P_esp = (busData(:, 2) - busData(:, 4)) / Sb;
+    Q_esp = (busData(:, 3) - busData(:, 5)) / Sb;
+    
+    V = ones(numBuses, 1);
+    theta = zeros(numBuses, 1);
+    
+    idx_P = [2, 3, 4];
+    idx_Q = [2, 4]; 
+    
+    conv = 1e-6;
+    max_it = 20;
+    
+    for it = 1:max_it
+        P_calc = zeros(numBuses, 1);
+        Q_calc = zeros(numBuses, 1);
+        
+        for i = 1:numBuses
+            for j = 1:numBuses
+                P_calc(i) = P_calc(i) + V(i)*V(j)*(G(i,j)*cos(theta(i)-theta(j)) + B(i,j)*sin(theta(i)-theta(j)));
+                Q_calc(i) = Q_calc(i) + V(i)*V(j)*(G(i,j)*sin(theta(i)-theta(j)) - B(i,j)*cos(theta(i)-theta(j)));
+            end
+        end
+        
+        dP = P_esp(idx_P) - P_calc(idx_P);
+        dQ = Q_esp(idx_Q) - Q_calc(idx_Q);
+        residuos = [dP; dQ];
+        
+        if max(abs(residuos)) < conv
+            fprintf('Convergência atingida na iteração %d\n', it-1);
+            break;
+        end
+        
+        J11 = zeros(length(idx_P), length(idx_P));
+        J12 = zeros(length(idx_P), length(idx_Q));
+        J21 = zeros(length(idx_Q), length(idx_P));
+        J22 = zeros(length(idx_Q), length(idx_Q));
+        
+        % Montagem genérica exata da Jacobiana
+        for i = 1:length(idx_P)
+            n = idx_P(i);
+            for j = 1:length(idx_P)
+                m = idx_P(j);
+                if n == m
+                    J11(i,j) = -Q_calc(n) - V(n)^2*B(n,n);
+                else
+                    J11(i,j) = V(n)*V(m)*(G(n,m)*sin(theta(n)-theta(m)) - B(n,m)*cos(theta(n)-theta(m)));
+                end
+            end
+            for j = 1:length(idx_Q)
+                m = idx_Q(j);
+                if n == m
+                    J12(i,j) = P_calc(n) + V(n)^2*G(n,n);
+                else
+                    J12(i,j) = V(n)*V(m)*(G(n,m)*cos(theta(n)-theta(m)) + B(n,m)*sin(theta(n)-theta(m)));
+                end
+            end
+        end
+        for i = 1:length(idx_Q)
+            n = idx_Q(i);
+            for j = 1:length(idx_P)
+                m = idx_P(j);
+                if n == m
+                    J21(i,j) = P_calc(n) - V(n)^2*G(n,n);
+                else
+                    J21(i,j) = -V(n)*V(m)*(G(n,m)*cos(theta(n)-theta(m)) + B(n,m)*sin(theta(n)-theta(m)));
+                end
+            end
+            for j = 1:length(idx_Q)
+                m = idx_Q(j);
+                if n == m
+                    J22(i,j) = Q_calc(n) - V(n)^2*B(n,n);
+                else
+                    J22(i,j) = V(n)*V(m)*(G(n,m)*sin(theta(n)-theta(m)) - B(n,m)*cos(theta(n)-theta(m)));
+                end
+            end
+        end
+        
+        J = [J11 J12; J21 J22];
+        correcoes = J \ residuos;
+        
+        theta(idx_P) = theta(idx_P) + correcoes(1:length(idx_P));
+        V(idx_Q) = V(idx_Q) + correcoes(length(idx_P)+1:end) .* V(idx_Q);
+        
+        fprintf('Iteração %d | max(dP,dQ) = %f\n', it, max(abs(residuos)));
+    end
+    
+    [S, P_slack, Q_slack, Q_gen4] = calcular_fluxos_finais(V, theta, Ybus, G, B, Sb, P_calc, Q_calc, numBuses);
+end
+
+function [V, S] = Desacoplado_Rapido(busData, Ybus, Sb, numBuses)
+    G = real(Ybus);
+    B = imag(Ybus);
+    
+    P_esp = (busData(:, 2) - busData(:, 4)) / Sb;
+    Q_esp = (busData(:, 3) - busData(:, 5)) / Sb;
+    
+    V = ones(numBuses, 1);
+    theta = zeros(numBuses, 1);
+    
+    idx_P = [2, 3, 4];
+    idx_Q = [2, 4];
+    
+    B_linha = -B(idx_P, idx_P);
+    B_duas_linhas = -B(idx_Q, idx_Q);
+    
+    conv = 1e-6;
+    max_it = 100;
+    
+    for it = 1:max_it
+        P_calc = zeros(numBuses, 1);
+        Q_calc = zeros(numBuses, 1);
+        
+        for i = 1:numBuses
+            for j = 1:numBuses
+                P_calc(i) = P_calc(i) + V(i)*V(j)*(G(i,j)*cos(theta(i)-theta(j)) + B(i,j)*sin(theta(i)-theta(j)));
+                Q_calc(i) = Q_calc(i) + V(i)*V(j)*(G(i,j)*sin(theta(i)-theta(j)) - B(i,j)*cos(theta(i)-theta(j)));
+            end
+        end
+        
+        dP = P_esp(idx_P) - P_calc(idx_P);
+        dQ = Q_esp(idx_Q) - Q_calc(idx_Q);
+        
+        if max(abs([dP; dQ])) < conv
+            fprintf('Convergência atingida na iteração %d\n', it-1);
+            break;
+        end
+        
+        dTheta = B_linha \ (dP ./ V(idx_P));
+        theta(idx_P) = theta(idx_P) + dTheta;
+        
+        % Recalcular Q após atualizar theta para maior precisão (opcional no desacoplado puro, mas mantido da sua estrutura)
+        dV = B_duas_linhas \ (dQ ./ V(idx_Q));
+        V(idx_Q) = V(idx_Q) + dV;
+        
+        fprintf('Iteração %d | max(dP,dQ) = %f\n', it, max(abs([dP; dQ])));
+    end
+    
+    [S, P_slack, Q_slack, Q_gen4] = calcular_fluxos_finais(V, theta, Ybus, G, B, Sb, P_calc, Q_calc, numBuses);
+end
+
+function [S, P_slack, Q_slack, Q_gen4] = calcular_fluxos_finais(V, theta, Ybus, G, B, Sb, P_calc, Q_calc, numBuses)
+    V_complex = V .* exp(1j * theta);
+    S = zeros(numBuses, numBuses);
+    
+    for i = 1:numBuses
+        for j = 1:numBuses
+            if i ~= j && Ybus(i,j) ~= 0
+                I_ij = (V_complex(i) - V_complex(j)) * -Ybus(i,j) + V_complex(i) * (Ybus(i,i) - sum(-Ybus(i,:)));
+                S(i,j) = V_complex(i) * conj(I_ij);
+            end
+        end
+    end
+    
+    fprintf('\n--- Tensões Finais ---\n');
+    for i = 1:numBuses
+        fprintf('V(%d) = %.4f pu | Ângulo = %.4f graus\n', i, V(i), rad2deg(theta(i)));
+    end
+    
+    P_slack = P_calc(1);
+    Q_slack = Q_calc(1);
+    Q_gen4 = Q_calc(4) + 1.5; % Qd4 = 150 MVAR = 1.5 pu
+    
+    fprintf('\nPotência Ativa gerada (Slack) = %.4f pu\n', P_slack);
+    fprintf('Potência Reativa gerada (Slack) = %.4f pu\n', Q_slack);
+    fprintf('Potência Reativa gerada (Barra 4) = %.4f pu\n', Q_gen4);
+end
